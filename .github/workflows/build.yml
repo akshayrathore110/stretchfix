@@ -1,0 +1,256 @@
+name: Build StretchFix module
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p libs stub/de/robv/android/xposed/callbacks stubout
+          mkdir -p src/main/java/com/example/stretchfix src/main/assets src/main/res/values
+
+          # ---- tiny stand-in for the Xposed API (only used to compile, not packaged) ----
+          cat > stub/de/robv/android/xposed/IXposedHookLoadPackage.java <<'EOF'
+          package de.robv.android.xposed;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          public interface IXposedHookLoadPackage { void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) throws Throwable; }
+          EOF
+          cat > stub/de/robv/android/xposed/XC_MethodHook.java <<'EOF'
+          package de.robv.android.xposed;
+          public abstract class XC_MethodHook {
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+            public static class MethodHookParam { public Object thisObject; public Object[] args; }
+            public class Unhook {}
+          }
+          EOF
+          cat > stub/de/robv/android/xposed/XposedBridge.java <<'EOF'
+          package de.robv.android.xposed;
+          import java.util.Set;
+          public final class XposedBridge {
+            public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> c, String n, XC_MethodHook cb) { return null; }
+            public static void log(String s) {}
+            public static void log(Throwable t) {}
+          }
+          EOF
+          cat > stub/de/robv/android/xposed/callbacks/XC_LoadPackage.java <<'EOF'
+          package de.robv.android.xposed.callbacks;
+          public abstract class XC_LoadPackage { public static class LoadPackageParam { public String packageName; public ClassLoader classLoader; } }
+          EOF
+          javac --release 8 -d stubout $(find stub -name '*.java')
+          jar cf libs/xposed-stub.jar -C stubout .
+
+          # ---- Gradle project ----
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'stretchfix'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2'
+          }
+          android {
+              namespace 'com.example.stretchfix'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.stretchfix'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          dependencies {
+              compileOnly files('libs/xposed-stub.jar')
+          }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+
+          cat > src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="StretchFix" android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Stretch a lowered display size to fill the whole panel" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+          cat > src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>android</item>
+              </string-array>
+          </resources>
+          EOF
+          echo "com.example.stretchfix.Hook" > src/main/assets/xposed_init
+
+          cat > src/main/java/com/example/stretchfix/Hook.java <<'EOF'
+          package com.example.stretchfix;
+
+          import android.graphics.Rect;
+
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.util.Set;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public class Hook implements IXposedHookLoadPackage {
+
+              private static final String TAG = "StretchFix: ";
+              private static boolean logged = false;
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+                  if (!"android".equals(lpp.packageName)) return;
+                  try {
+                      Class<?> dd = Class.forName(
+                              "com.android.server.display.DisplayDevice", false, lpp.classLoader);
+                      Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(
+                              dd, "setProjectionLocked", new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      stretch(p);
+                                  }
+                              });
+                      XposedBridge.log(TAG + "hooked " + hooks.size() + " method(s)");
+                      if (hooks.isEmpty()) {
+                          for (Method m : dd.getDeclaredMethods()) {
+                              XposedBridge.log(TAG + "available: " + m);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "setup failed");
+                      XposedBridge.log(t);
+                  }
+              }
+
+              static void stretch(XC_MethodHook.MethodHookParam p) {
+                  try {
+                      Object[] a = p.args;
+                      int orientation = -1;
+                      int rectCount = 0;
+                      int displayIdx = -1;
+                      for (int i = 0; i < a.length; i++) {
+                          if (a[i] instanceof Integer && orientation < 0) {
+                              orientation = (Integer) a[i];
+                          } else if (a[i] instanceof Rect) {
+                              rectCount++;
+                              displayIdx = i; // the last Rect is the display rect
+                          }
+                      }
+                      if (orientation < 0 || rectCount != 2) return;
+
+                      Object info = call(p.thisObject, "getDisplayDeviceInfoLocked");
+                      try {
+                          if (getInt(info, "type") != 1) return; // internal panel only
+                      } catch (Throwable ignored) {
+                      }
+                      int w = getInt(info, "width");
+                      int h = getInt(info, "height");
+                      if (orientation == 1 || orientation == 3) {
+                          int t = w;
+                          w = h;
+                          h = t;
+                      }
+                      if (w <= 0 || h <= 0) return;
+
+                      Rect old = (Rect) a[displayIdx];
+                      if (old.left == 0 && old.top == 0 && old.right == w && old.bottom == h) return;
+
+                      a[displayIdx] = new Rect(0, 0, w, h); // fill the whole panel
+                      if (!logged) {
+                          logged = true;
+                          XposedBridge.log(TAG + "stretching to " + w + "x" + h);
+                      }
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "stretch failed");
+                      XposedBridge.log(t);
+                  }
+              }
+
+              private static Object call(Object obj, String name) throws Exception {
+                  for (Class<?> c = obj.getClass(); c != null; c = c.getSuperclass()) {
+                      for (Method m : c.getDeclaredMethods()) {
+                          if (m.getName().equals(name) && m.getParameterTypes().length == 0) {
+                              m.setAccessible(true);
+                              return m.invoke(obj);
+                          }
+                      }
+                  }
+                  throw new NoSuchMethodException(name);
+              }
+
+              private static int getInt(Object obj, String name) throws Exception {
+                  for (Class<?> c = obj.getClass(); c != null; c = c.getSuperclass()) {
+                      try {
+                          Field f = c.getDeclaredField(name);
+                          f.setAccessible(true);
+                          return f.getInt(obj);
+                      } catch (NoSuchFieldException ignored) {
+                      }
+                  }
+                  throw new NoSuchFieldException(name);
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Check the APK contains the module entry
+        run: |
+          APK=$(ls build/outputs/apk/debug/*.apk | head -1)
+          cp "$APK" StretchFix.apk
+          unzip -l StretchFix.apk | grep assets/xposed_init
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StretchFix-apk
+          path: StretchFix.apk
+
+      - name: Publish release with the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" StretchFix.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "StretchFix build ${{ github.run_number }}" \
+            --notes "Install the APK, enable it in Vector with System Framework scope, then reboot."
